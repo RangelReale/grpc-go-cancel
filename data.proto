@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package omdata;
+option go_package = "github.com/RangelReale/grpc-go-cancel;main";
+
+message Data {
+  string data = 1;
+}
+
+service DataService {
+  rpc Handler(stream Data) returns (stream Data) {}
+}
