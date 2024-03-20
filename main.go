@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -92,7 +93,7 @@ func (d *dataServer) Handler(handlerServer DataService_HandlerServer) error {
 				return nil
 			}
 			slog.Info("{server} received data", "data", data.Data)
-		case <-time.After(4 * time.Second):
+		case <-time.After(8 * time.Second):
 			return status.Error(codes.FailedPrecondition, "simulated timeout precondition")
 		}
 	}
@@ -113,6 +114,8 @@ func server() error {
 
 func client() error {
 	ctx := context.Background()
+
+	ctx, cancel := context.WithCancelCause(ctx)
 
 	slog.Info("[client] connecting", "address", "localhost:18991")
 	conn, err := grpc.DialContext(ctx, "localhost:18991",
@@ -136,6 +139,7 @@ func client() error {
 	// process stream
 
 	dataChan := make(chan *Data)
+	var dataErr atomic.Value
 
 	go func() {
 		defer close(dataChan)
@@ -144,15 +148,20 @@ func client() error {
 			data, err := handlerClient.Recv()
 			if errors.Is(err, io.EOF) {
 				slog.Info("[client] [recv] received EOF")
+				dataErr.Store(err)
+				cancel(err)
 				return
 			}
 			if err != nil {
 				slog.Info("[client] [recv] received error", "error", err)
+				dataErr.Store(err)
+				cancel(err)
 				return
 			}
 			select {
 			case <-handlerClient.Context().Done():
 				slog.Info("[client] [recv] context done", "cause", context.Cause(handlerClient.Context()))
+				dataErr.Store(context.Cause(handlerClient.Context()))
 				return
 			case dataChan <- data:
 			}
@@ -167,14 +176,20 @@ func client() error {
 
 	for {
 		select {
-		case <-handlerClient.Context().Done():
-			slog.Info("[client] context done", "cause", context.Cause(handlerClient.Context()))
-			return context.Cause(handlerClient.Context())
+		case <-ctx.Done():
+			slog.Info("[client] context done", "cause", context.Cause(ctx))
+			return context.Cause(ctx)
 		case data, ok := <-dataChan:
 			if !ok {
+				derr := dataErr.Load()
+				if derr != nil {
+					return derr.(error)
+				}
 				return nil
 			}
 			slog.Info("[client] received data", "data", data.Data)
+		case <-time.After(3 * time.Second):
+			cancel(errors.New("client self-cancel"))
 		}
 	}
 }
