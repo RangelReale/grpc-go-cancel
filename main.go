@@ -8,9 +8,12 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 func main() {
@@ -22,8 +25,9 @@ func main() {
 
 		err := server()
 		if err != nil {
-			slog.Error("server error", "error", err.Error())
+			slog.Error("server: error", "error", err.Error())
 		}
+		slog.Info("server: finished")
 	}()
 
 	wg.Add(1)
@@ -32,8 +36,9 @@ func main() {
 
 		err := client()
 		if err != nil {
-			slog.Error("client error", "error", err.Error())
+			slog.Error("client: error", "error", err.Error())
 		}
+		slog.Info("client: finished")
 	}()
 
 	wg.Wait()
@@ -46,6 +51,7 @@ func (d *dataServer) Handler(handlerServer DataService_HandlerServer) error {
 	dataChan := make(chan *Data)
 
 	go func() {
+		defer close(dataChan)
 		for {
 			data, err := handlerServer.Recv()
 			if errors.Is(err, io.EOF) {
@@ -77,6 +83,8 @@ func (d *dataServer) Handler(handlerServer DataService_HandlerServer) error {
 				return nil
 			}
 			slog.Info("server: received data", "data", data.Data)
+		case <-time.After(4 * time.Second):
+			return status.Error(codes.FailedPrecondition, "simulated timeout precondition")
 		}
 	}
 }
@@ -119,6 +127,8 @@ func client() error {
 	dataChan := make(chan *Data)
 
 	go func() {
+		defer close(dataChan)
+
 		for {
 			data, err := handlerClient.Recv()
 			if errors.Is(err, io.EOF) {
