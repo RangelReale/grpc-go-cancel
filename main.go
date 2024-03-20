@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,6 +19,11 @@ import (
 )
 
 func main() {
+	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	})
+	slog.SetDefault(slog.New(h))
+
 	var wg sync.WaitGroup
 
 	wg.Add(1)
@@ -45,62 +51,24 @@ func main() {
 	wg.Wait()
 }
 
-type dataServer struct {
+type wrappedStream struct {
+	grpc.ServerStream
+	ctx context.Context
 }
 
-func (d *dataServer) Handler(handlerServer DataService_HandlerServer) error {
-	slog.Info("{server} client connected")
-	defer func() {
-		slog.Info("{server} client disconnected")
-	}()
-
-	dataChan := make(chan *Data)
-
-	go func() {
-		defer close(dataChan)
-		for {
-			data, err := handlerServer.Recv()
-			if errors.Is(err, io.EOF) {
-				slog.Info("{server} [recv] received EOF")
-				return
-			}
-			if err != nil {
-				slog.Info("{server} [recv] received error", "error", err)
-				return
-			}
-			select {
-			case <-handlerServer.Context().Done():
-				slog.Info("{server} [recv] context done", "cause", context.Cause(handlerServer.Context()))
-				return
-			case dataChan <- data:
-			}
-		}
-	}()
-
-	slog.Info("[server] sending", "data", "server-test-1")
-	err := handlerServer.Send(&Data{Data: "server-test-1"})
-	if err != nil {
-		slog.Error(err.Error())
-	}
-
-	for {
-		select {
-		case <-handlerServer.Context().Done():
-			slog.Info("{server} context done", "cause", context.Cause(handlerServer.Context()))
-			return context.Cause(handlerServer.Context())
-		case data, ok := <-dataChan:
-			if !ok {
-				return nil
-			}
-			slog.Info("{server} received data", "data", data.Data)
-		case <-time.After(8 * time.Second):
-			return status.Error(codes.FailedPrecondition, "simulated timeout precondition")
-		}
-	}
+func (s *wrappedStream) Context() context.Context {
+	return s.ctx
 }
 
 func server() error {
-	gServer := grpc.NewServer()
+	gServer := grpc.NewServer(
+		grpc.StreamInterceptor(func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+			ctx := context.WithValue(ss.Context(), "x", "12")
+			ctx, cancel := context.WithCancelCause(ctx)
+			ctx = context.WithValue(ctx, "cancel", cancel)
+			return handler(srv, &wrappedStream{ss, ctx})
+		}),
+	)
 	server := &dataServer{}
 	RegisterDataServiceServer(gServer, server)
 
@@ -112,9 +80,95 @@ func server() error {
 	return gServer.Serve(listener)
 }
 
+type dataServer struct {
+}
+
+func (d *dataServer) Handler(handlerServer DataService_HandlerServer) error {
+	err := d.handler(handlerServer)
+	if err != nil {
+		slog.Error("{server} handler returned error", "error", err)
+	}
+	return err
+}
+
+func (d *dataServer) handler(handlerServer DataService_HandlerServer) error {
+	slog.Info("{server} client connected")
+	defer func() {
+		slog.Info("{server} client disconnected")
+	}()
+
+	ctx := context.Background()
+	ctx, cancel := context.WithCancelCause(ctx)
+
+	interceptorCancel := handlerServer.Context().Value("cancel").(context.CancelCauseFunc)
+
+	dataChan := make(chan *Data)
+	var dataErr atomic.Value
+
+	go func() {
+		defer close(dataChan)
+		for {
+			data, err := handlerServer.Recv()
+			if errors.Is(err, io.EOF) {
+				slog.Debug("{server} [recv] received EOF")
+				dataErr.Store(err)
+				cancel(err)
+				return
+			}
+			if err != nil {
+				slog.Debug("{server} [recv] received error", "error", err)
+				dataErr.Store(err)
+				cancel(err)
+				return
+			}
+			select {
+			case <-handlerServer.Context().Done():
+				slog.Debug("{server} [recv] context done", "cause", context.Cause(handlerServer.Context()))
+				dataErr.Store(context.Cause(handlerServer.Context()))
+				cancel(context.Cause(handlerServer.Context()))
+				return
+			case dataChan <- data:
+			}
+		}
+	}()
+
+	slog.Debug("[server] context x", "x", handlerServer.Context().Value("x"))
+
+	slog.Debug("[server] sending", "data", "server-test-1")
+	err := handlerServer.Send(&Data{Data: "server-test-1"})
+	if err != nil {
+		slog.Error(err.Error())
+	}
+
+	for {
+		select {
+		case <-handlerServer.Context().Done():
+			slog.Debug("{server} handlerServer context done", "cause", context.Cause(handlerServer.Context()))
+			return context.Cause(handlerServer.Context())
+		case <-ctx.Done():
+			slog.Debug("{server} context done", "cause", context.Cause(ctx))
+			return context.Cause(ctx)
+		case data, ok := <-dataChan:
+			if !ok {
+				slog.Debug("{server} data chan closed", "cause", dataErr.Load())
+				derr := dataErr.Load()
+				if derr != nil {
+					return derr.(error)
+				}
+				return nil
+			}
+			slog.Debug("{server} received data", "data", data.Data)
+		case <-time.After(6 * time.Second):
+			slog.Debug("{server} interceptor cancel")
+			interceptorCancel(errors.New("interceptor cancel"))
+		case <-time.After(12 * time.Second):
+			return status.Error(codes.FailedPrecondition, "simulated timeout precondition")
+		}
+	}
+}
+
 func client() error {
 	ctx := context.Background()
-
 	ctx, cancel := context.WithCancelCause(ctx)
 
 	slog.Info("[client] connecting", "address", "localhost:18991")
@@ -147,21 +201,22 @@ func client() error {
 		for {
 			data, err := handlerClient.Recv()
 			if errors.Is(err, io.EOF) {
-				slog.Info("[client] [recv] received EOF")
+				slog.Debug("[client] [recv] received EOF")
 				dataErr.Store(err)
 				cancel(err)
 				return
 			}
 			if err != nil {
-				slog.Info("[client] [recv] received error", "error", err)
+				slog.Debug("[client] [recv] received error", "error", err)
 				dataErr.Store(err)
 				cancel(err)
 				return
 			}
 			select {
 			case <-handlerClient.Context().Done():
-				slog.Info("[client] [recv] context done", "cause", context.Cause(handlerClient.Context()))
+				slog.Debug("[client] [recv] context done", "cause", context.Cause(handlerClient.Context()))
 				dataErr.Store(context.Cause(handlerClient.Context()))
+				cancel(context.Cause(handlerClient.Context()))
 				return
 			case dataChan <- data:
 			}
@@ -177,19 +232,21 @@ func client() error {
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Info("[client] context done", "cause", context.Cause(ctx))
+			slog.Debug("[client] context done", "cause", context.Cause(ctx))
 			return context.Cause(ctx)
 		case data, ok := <-dataChan:
 			if !ok {
+				slog.Debug("[client] data chan closed", "cause", dataErr.Load())
 				derr := dataErr.Load()
 				if derr != nil {
 					return derr.(error)
 				}
 				return nil
 			}
-			slog.Info("[client] received data", "data", data.Data)
+			slog.Debug("[client] received data", "data", data.Data)
 		case <-time.After(3 * time.Second):
-			cancel(errors.New("client self-cancel"))
+			_ = handlerClient.CloseSend()
+			// 	cancel(errors.New("client self-cancel"))
 		}
 	}
 }
