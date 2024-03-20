@@ -76,6 +76,12 @@ func (d *dataServer) Handler(handlerServer DataService_HandlerServer) error {
 		}
 	}()
 
+	slog.Info("[server] sending", "data", "server-test-1")
+	err := handlerServer.Send(&Data{Data: "server-test-1"})
+	if err != nil {
+		slog.Error(err.Error())
+	}
+
 	for {
 		select {
 		case <-handlerServer.Context().Done():
@@ -154,7 +160,6 @@ func client() error {
 	}()
 
 	slog.Info("[client] sending", "data", "test1")
-
 	err = handlerClient.Send(&Data{Data: "test1"})
 	if err != nil {
 		slog.Error(err.Error())
