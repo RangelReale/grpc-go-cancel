@@ -13,9 +13,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/status"
 )
 
 func main() {
@@ -97,10 +95,11 @@ func (d *dataServer) handler(handlerServer DataService_HandlerServer) error {
 		slog.Info("{server} client disconnected")
 	}()
 
-	ctx := context.Background()
+	// ctx := context.Background()
+	ctx := handlerServer.Context()
 	ctx, cancel := context.WithCancelCause(ctx)
 
-	interceptorCancel := handlerServer.Context().Value("cancel").(context.CancelCauseFunc)
+	// interceptorCancel := handlerServer.Context().Value("cancel").(context.CancelCauseFunc)
 
 	dataChan := make(chan *Data)
 	var dataErr atomic.Value
@@ -158,11 +157,11 @@ func (d *dataServer) handler(handlerServer DataService_HandlerServer) error {
 				return nil
 			}
 			slog.Debug("{server} received data", "data", data.Data)
-		case <-time.After(6 * time.Second):
-			slog.Debug("{server} interceptor cancel")
-			interceptorCancel(errors.New("interceptor cancel"))
-		case <-time.After(12 * time.Second):
-			return status.Error(codes.FailedPrecondition, "simulated timeout precondition")
+			// case <-time.After(6 * time.Second):
+			// 	slog.Debug("{server} interceptor cancel")
+			// 	interceptorCancel(errors.New("interceptor cancel"))
+			// case <-time.After(12 * time.Second):
+			// 	return status.Error(codes.FailedPrecondition, "simulated timeout precondition")
 		}
 	}
 }
